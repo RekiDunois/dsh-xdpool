@@ -32970,6 +32970,13 @@ var DsmlContentExtractor = class {
     return { text: remaining, reasoning: "" };
   }
 };
+// CodeArts rejects an oversized max_tokens with an HTTP-200 SSE error frame
+// (`InferHub.4001.200 The request param is invalid`) rather than a 4xx, so it
+// surfaces to the user as an opaque INVALID_REQUEST. 65536 is the measured
+// ceiling; 131072 already produces an empty stream. Keep the advertised default
+// and the final wire request on that same ceiling - TRAE and Cline do the same
+// with clampTraeMaxTokens / clampClineMaxTokens.
+var CODEARTS_MAX_OUTPUT_TOKENS = 65536;
 var CodeArtsAdapter = class extends LlmAdapter {
   constructor(options) {
     super();
@@ -33043,6 +33050,7 @@ var CodeArtsAdapter = class extends LlmAdapter {
         id: m.id,
         name: m.name,
         inputModalities: modalitiesFor(m.id),
+        maxTokens: CODEARTS_MAX_OUTPUT_TOKENS,
         ...contextWindow === void 0 ? {} : { contextWindow }
       };
     });
@@ -33052,7 +33060,15 @@ var CodeArtsAdapter = class extends LlmAdapter {
     const remoteModel = this.remoteModels?.find((m) => m.id === model);
     const name2 = remoteModel?.name ?? model;
     const contextWindow = contextWindowFor(model);
-    const resolved = { provider, id: model, name: name2, inputModalities: modalitiesFor(model) };
+    const resolved = {
+      provider,
+      id: model,
+      name: name2,
+      inputModalities: modalitiesFor(model),
+      // catalogFactsFor() forwards this as fact.maxTokens; without it the host
+      // has no way to learn the ceiling and passes its own catalog value through.
+      defaultMaxTokens: CODEARTS_MAX_OUTPUT_TOKENS
+    };
     if (contextWindow !== void 0) resolved.context = { contextWindow };
     resolved.reasoning = {
       efforts: [
@@ -33134,9 +33150,11 @@ var CodeArtsAdapter = class extends LlmAdapter {
       // 大文件 write 工具参数（如 1000-2000+ 行文档）需要数万 token 的生成空间，
       // 若沿用后端默认输出上限，参数 JSON 会在中途被截断成非法 JSON，harness
       // 工具校验报 `invalid arguments: "arguments" must be an object`。
-      // 参考实现 e2e 实测：65536 可用，131072 反而触发空流被后端拒绝；
-      // 显式传入的 options.maxTokens 优先，未设置时默认 65536。
-      max_tokens: options.maxTokens ?? 65536,
+      // 参考实现 e2e 实测：65536 可用，131072 反而触发空流被后端拒绝。
+      // 因此这是上限而不只是默认值：调用方传来的更大值（宿主模型目录里别的
+      // provider 带 384000）会被原样发出并触发 INVALID_REQUEST，必须收回；
+      // 调用方主动设的较小值保留。
+      max_tokens: Math.min(options.maxTokens ?? CODEARTS_MAX_OUTPUT_TOKENS, CODEARTS_MAX_OUTPUT_TOKENS),
       ...wireTools !== void 0 && wireTools.length > 0 ? { tools: wireTools } : {}
     });
     const url = `${CHAT_API_BASE}/chat/completions`;

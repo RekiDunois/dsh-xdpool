@@ -1,6 +1,43 @@
 # Changelog
 本项目的所有重要变更都会记录在此文件。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+## 未发布 — CodeArts 的输出上限是上限，不是默认值
+
+> 华为这条链接 65536 能用、131072 就空流，代码里也一直写着这个数字。但它是 `options.maxTokens ?? 65536` —— 只兜底，不设界。
+
+### 触发条件：宿主把别的 provider 的额度原样递过来
+
+宿主从模型目录里取 `maxTokens` 填进 `options.maxTokens`，而那份目录里 384000 是 deepseek-v4-pro、fireworks、huggingface 这些**真的能到 384000** 的条目的正常值。CodeArts 自己没声明上限时，这个 384000 就原样发出去了。
+
+后果不是 4xx：后端回 **HTTP 200**，把错误装在 SSE 帧里 ——
+
+```
+InferHub.4001.200 The request param is invalid, Please check it
+```
+
+适配器把它映射成 `INVALID_REQUEST`。用户看到的是「这个账号好好的，突然发不出话」，而新建会话发「你好」就失败，第一反应必然是密钥坏了 —— 这也是 #69「CodeArts 提示密钥无效」的一条候选根因（#69 正文只有一句话，无法确认是这条还是 403 那条，故 #83 里保留判断）。
+
+### 实测（2026-10-25，失败会话的原文 system/user + 全部 133 个 tools 直连，只改 max_tokens）
+
+| max_tokens | 结果 |
+| --- | --- |
+| 384000 | HTTP 200 + SSE 错误帧 `InferHub.4001.200` → INVALID_REQUEST |
+| 131072 | HTTP 200，空流 |
+| 65536 | 正常流式回复 |
+
+### 改法：三处对齐，线上请求做 clamp
+
+- `listModels()` 每个模型带 `maxTokens`，宿主没有理由再自己猜一个更大的
+- `resolveModel()` 带 `defaultMaxTokens`，`catalogFactsFor()` 会把它当 `fact.maxTokens` 交给宿主 —— 这是宿主唯一能知道上限的通道
+- 线上 `max_tokens: Math.min(options.maxTokens ?? CODEARTS_MAX_OUTPUT_TOKENS, CODEARTS_MAX_OUTPUT_TOKENS)`，调用方给更大就收回，给更小仍保留
+
+TRAE 与 Cline 早就这么做了（`clampTraeMaxTokens` / `clampClineMaxTokens`，也都写 `resolved.defaultMaxTokens`），CodeArts 是唯一的例外。
+
+- 回归：`tests/codearts-max-tokens.test.ts` 新增 5 例（源码断言，与 `tests/codearts-resign-headers.test.ts` 同形状 —— `pack.js` 是另一个仓库的构建产物，无法 import 驱动）
+- 反向对照：撤掉 `pack.js` 的补丁后 5 例全红，补上全绿
+
+Refs #83, #69。
+
 ## 未发布 — 第三条内容指纹：文件引用指引里的 “resolve from the workspace root”
 
 > 2.4.1/2.4.2 修好的两个指纹管了一周，10 月 28 日又整片 400/11128。这次被点名的不是产品名，而是一句普通说明。
